@@ -2,7 +2,6 @@ package com.vanta.ffaimbot
 
 import android.app.Activity
 import android.content.Intent
-import android.graphics.PointF
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Bundle
@@ -24,7 +23,6 @@ class MainActivity : Activity() {
     private lateinit var btnClearLog: Button
     private lateinit var projMgr: MediaProjectionManager
 
-    private var launched = false
     private val handler = Handler(Looper.getMainLooper())
 
     private val logRefresher = object : Runnable {
@@ -37,11 +35,11 @@ class MainActivity : Activity() {
 
     private val shizukuListener = Shizuku.OnRequestPermissionResultListener { _, result ->
         if (result == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            Logger.log("Main", "Shizuku permission granted")
+            Logger.log("Main", "Shizuku granted")
             status("Shizuku OK")
-            requestCapture()
+            flow()
         } else {
-            Logger.log("Main", "Shizuku permission denied")
+            Logger.log("Main", "Shizuku denied")
             status("Shizuku denied — open Shizuku app and grant permission")
         }
     }
@@ -49,17 +47,16 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-
         Logger.init(this)
-        Logger.log("Main", "onCreate")
+        Logger.log("Main", "onCreate Android API=${android.os.Build.VERSION.SDK_INT}")
 
-        tvStatus       = findViewById(R.id.tvStatus)
-        tvLog          = findViewById(R.id.tvLog)
-        scrollLog      = findViewById(R.id.scrollLog)
-        btnAction      = findViewById(R.id.btnAction)
-        btnTestInject  = findViewById(R.id.btnTestInject)
-        btnClearLog    = findViewById(R.id.btnClearLog)
-        projMgr        = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        tvStatus      = findViewById(R.id.tvStatus)
+        tvLog         = findViewById(R.id.tvLog)
+        scrollLog     = findViewById(R.id.scrollLog)
+        btnAction     = findViewById(R.id.btnAction)
+        btnTestInject = findViewById(R.id.btnTestInject)
+        btnClearLog   = findViewById(R.id.btnClearLog)
+        projMgr       = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
         btnAction.setOnClickListener { flow() }
 
@@ -68,21 +65,20 @@ class MainActivity : Activity() {
             tvLog.text = ""
         }
 
-        // Fires a swipe at screen center to verify injection works without opening FF
         btnTestInject.setOnClickListener {
-            Logger.log("Main", "Test inject triggered")
+            Logger.log("Main", "test inject pressed")
             Thread {
                 val ok = InputInjector.init()
-                Logger.log("Main", "Injector init = $ok")
+                Logger.log("Main", "injector init=$ok")
                 if (ok) {
                     val w = resources.displayMetrics.widthPixels.toFloat()
                     val h = resources.displayMetrics.heightPixels.toFloat()
-                    val from = PointF(w / 2f, h / 2f)
-                    val to   = PointF(w / 2f + 200f, h / 2f)
-                    InputInjector.swipeAim(from, to, 100L)
-                    Logger.log("Main", "Test swipe injected: ${from.x},${from.y} -> ${to.x},${to.y}")
-                } else {
-                    Logger.log("Main", "Injector init FAILED — check Shizuku")
+                    InputInjector.swipeAim(
+                        android.graphics.PointF(w / 2f, h / 2f),
+                        android.graphics.PointF(w / 2f + 300f, h / 2f),
+                        100L
+                    )
+                    Logger.log("Main", "test swipe sent")
                 }
             }.start()
         }
@@ -92,7 +88,7 @@ class MainActivity : Activity() {
     }
 
     private fun flow() {
-        Logger.log("Main", "flow() — shizuku=${ShizukuHelper.isRunning()} perm=${ShizukuHelper.hasPermission()} proj=${ProjectionHolder.projection != null} overlay=${Settings.canDrawOverlays(this)}")
+        Logger.log("Main", "flow() shizuku=${ShizukuHelper.isRunning()} perm=${ShizukuHelper.hasPermission()} overlay=${Settings.canDrawOverlays(this)}")
         when {
             !ShizukuHelper.isRunning() -> {
                 status("Shizuku not running — start Shizuku first")
@@ -103,12 +99,8 @@ class MainActivity : Activity() {
                     ShizukuHelper.requestPermission(shizukuListener)
                 } catch (e: Exception) {
                     Logger.log("Main", "requestPermission failed: ${e.message}")
-                    status("Failed: ${e.message}")
+                    status("Shizuku error: ${e.message}")
                 }
-            }
-            ProjectionHolder.projection == null -> {
-                status("Grant screen capture…")
-                requestCapture()
             }
             !Settings.canDrawOverlays(this) -> {
                 status("Grant overlay permission…")
@@ -119,13 +111,31 @@ class MainActivity : Activity() {
                     )
                 )
             }
-            else -> launchService()
+            else -> {
+                // Android 14+: foreground service with mediaProjection type must be running
+                // BEFORE getMediaProjection() is called.
+                // Step 1: start service (foreground only, no projection yet)
+                // Step 2: request screen capture
+                // Step 3: onActivityResult sends result to already-running service
+                // Step 4: service calls getMediaProjection() — now valid
+                Logger.log("Main", "starting service foreground-only, then requesting capture")
+                status("Starting service…")
+
+                val fgIntent = Intent(this, AimbotService::class.java).apply {
+                    action = AimbotService.ACTION_START_FG
+                }
+                startForegroundService(fgIntent)
+
+                // Small delay to let service enter foreground before system validates the token
+                handler.postDelayed({ requestCapture() }, 500L)
+            }
         }
     }
 
     @Suppress("DEPRECATION")
     private fun requestCapture() {
         Logger.log("Main", "requesting screen capture")
+        status("Grant screen capture…")
         startActivityForResult(projMgr.createScreenCaptureIntent(), RC_PROJ)
     }
 
@@ -137,47 +147,34 @@ class MainActivity : Activity() {
         Logger.log("Main", "onActivityResult resultCode=$resultCode dataNull=${data == null}")
 
         if (resultCode == Activity.RESULT_OK && data != null) {
-            val projection = try {
-                projMgr.getMediaProjection(resultCode, data)
-            } catch (e: Exception) {
-                Logger.log("Main", "getMediaProjection exception: ${e.message}")
-                status("MediaProjection failed: ${e.message}")
-                return
+            // Send result to the already-running foreground service.
+            // Service calls getMediaProjection() — valid because service is already foreground.
+            Logger.log("Main", "sending projection data to service")
+            val svcIntent = Intent(this, AimbotService::class.java).apply {
+                action = AimbotService.ACTION_ATTACH_PROJECTION
+                putExtra(AimbotService.EXTRA_RESULT_CODE, resultCode)
+                putExtra(AimbotService.EXTRA_DATA, data)
             }
+            startService(svcIntent)
 
-            if (projection == null) {
-                Logger.log("Main", "getMediaProjection returned null")
-                status("Screen capture returned null — try again")
-                return
-            }
-
-            Logger.log("Main", "MediaProjection created OK")
-            ProjectionHolder.projection = projection
-            flow()
+            status("Running — open FF Max now")
+            btnAction.text = "RUNNING"
+            btnAction.isEnabled = false
         } else {
-            Logger.log("Main", "screen capture denied or cancelled")
-            status("Screen capture denied — try again")
+            Logger.log("Main", "screen capture denied resultCode=$resultCode")
+            status("Screen capture denied — tap START to retry")
+            btnAction.isEnabled = true
         }
-    }
-
-    private fun launchService() {
-        if (launched) return
-        if (!Settings.canDrawOverlays(this)) {
-            status("Overlay permission needed")
-            return
-        }
-        launched = true
-        Logger.log("Main", "starting AimbotService")
-        startForegroundService(Intent(this, AimbotService::class.java))
-        status("Running — open FF Max now")
-        btnAction.text = "RUNNING"
-        btnAction.isEnabled = false
     }
 
     override fun onResume() {
         super.onResume()
-        if (!launched && ProjectionHolder.projection != null && Settings.canDrawOverlays(this)) {
-            launchService()
+        // Re-check overlay after returning from settings
+        if (ShizukuHelper.isRunning() && ShizukuHelper.hasPermission()
+            && Settings.canDrawOverlays(this)
+            && btnAction.isEnabled
+        ) {
+            // Don't auto-restart, let user tap START
         }
     }
 
@@ -187,11 +184,7 @@ class MainActivity : Activity() {
         ShizukuHelper.removePermissionListener(shizukuListener)
     }
 
-    private fun status(msg: String) {
-        tvStatus.text = msg
-    }
+    private fun status(msg: String) { tvStatus.text = msg }
 
-    companion object {
-        private const val RC_PROJ = 2001
-    }
+    companion object { private const val RC_PROJ = 2001 }
 }
