@@ -1,32 +1,34 @@
-// language: Kotlin, file: ShizukuHelper.kt
-// Manages Shizuku permission lifecycle and binder availability check
 package com.vanta.ffaimbot
 
 import android.content.pm.PackageManager
+import android.os.IBinder
 import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuBinderWrapper
 
 object ShizukuHelper {
 
     private const val REQUEST_CODE = 1001
 
-    // true if Shizuku daemon is running and permission granted
-    fun isAvailable(): Boolean {
-        return try {
-            Shizuku.pingBinder() && hasPermission()
-        } catch (e: IllegalStateException) {
-            false
-        }
-    }
-
     fun hasPermission(): Boolean {
-        return if (Shizuku.isPreV11() || Shizuku.getVersion() < 11) {
+        return try {
+            if (Shizuku.isPreV11()) {
+                false
+            } else {
+                Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+            }
+        } catch (e: Exception) {
             false
-        } else {
-            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
         }
     }
 
-    // Call from Activity.onRequestPermissionsResult with Shizuku's callback registration
+    fun isRunning(): Boolean {
+        return try {
+            Shizuku.pingBinder()
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     fun requestPermission(listener: Shizuku.OnRequestPermissionResultListener) {
         Shizuku.addRequestPermissionResultListener(listener)
         Shizuku.requestPermission(REQUEST_CODE)
@@ -36,15 +38,14 @@ object ShizukuHelper {
         Shizuku.removeRequestPermissionResultListener(listener)
     }
 
-    // Wraps a system binder with Shizuku's proxy — allows hidden API calls at ADB level
-    fun getSystemServiceBinder(serviceName: String): android.os.IBinder? {
+    // Wraps the raw system binder with ShizukuBinderWrapper so calls
+    // execute at ADB (shell uid 2000) privilege — same as IInputManager path A in GameMapperMind
+    fun getSystemServiceBinder(name: String): IBinder? {
         return try {
-            // Reflect ServiceManager since it's hidden, then wrap with ShizukuBinderWrapper
-            val serviceManagerClass = Class.forName("android.os.ServiceManager")
-            val getService = serviceManagerClass.getMethod("getService", String::class.java)
-            val rawBinder = getService.invoke(null, serviceName) as? android.os.IBinder
-                ?: return null
-            rikka.shizuku.ShizukuBinderWrapper(rawBinder)
+            val sm = Class.forName("android.os.ServiceManager")
+            val get = sm.getMethod("getService", String::class.java)
+            val raw = get.invoke(null, name) as? IBinder ?: return null
+            ShizukuBinderWrapper(raw)
         } catch (e: Exception) {
             null
         }
