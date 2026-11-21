@@ -7,6 +7,8 @@ import android.app.Service
 import android.content.Intent
 import android.graphics.PointF
 import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -21,21 +23,31 @@ import kotlinx.coroutines.launch
 class AimbotService : Service() {
 
     companion object {
+        // Action: start foreground only — no projection yet
+        const val ACTION_START_FG          = "com.vanta.ffaimbot.START_FG"
+        // Action: attach MediaProjection after Activity gets the result
+        const val ACTION_ATTACH_PROJECTION = "com.vanta.ffaimbot.ATTACH_PROJECTION"
+
+        const val EXTRA_RESULT_CODE = "result_code"
+        const val EXTRA_DATA        = "data"
+
         private const val CHANNEL_ID = "ffaimbot"
         private const val NOTIF_ID   = 1
         private const val FPS_DELAY  = 66L
 
-        private fun aimMs(): Long = 28L + (Math.random() * 16).toLong()
+        private fun aimMs() = 28L + (Math.random() * 16).toLong()
     }
 
     private var capture: ScreenCaptureManager? = null
     private var detector: EnemyDetector? = null
     private var overlay: OverlayManager? = null
 
-    @Volatile private var enabled    = false
+    @Volatile private var enabled = false
     @Volatile private var lastTarget: PointF? = null
+
     private var frameCount  = 0
     private var detectCount = 0
+    private var projectionAttached = false
 
     private val job         = SupervisorJob()
     private val scope       = CoroutineScope(Dispatchers.Default + job)
@@ -46,25 +58,76 @@ class AimbotService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
-        startForeground(NOTIF_ID, buildNotif())
-        Logger.log("Service", "onCreate")
-
-        val injOk = InputInjector.init()
-        Logger.log("Service", "InputInjector.init = $injOk")
+        // Enter foreground immediately — Android 14 requires this before getMediaProjection()
+        startForeground(NOTIF_ID, buildNotif("Waiting for screen capture…"))
+        Logger.log("Service", "onCreate — foreground started, waiting for projection")
+        InputInjector.init()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Logger.log("Service", "onStartCommand")
+        val action = intent?.action ?: ""
+        Logger.log("Service", "onStartCommand action=$action")
 
-        val projection: MediaProjection = ProjectionHolder.projection ?: run {
-            Logger.log("Service", "FAIL: ProjectionHolder.projection is null")
-            stopSelf()
-            return START_NOT_STICKY
+        when (action) {
+            ACTION_START_FG -> {
+                // Already handled in onCreate — foreground is running.
+                // MainActivity will send ACTION_ATTACH_PROJECTION shortly.
+                Logger.log("Service", "foreground ready, awaiting projection data")
+            }
+
+            ACTION_ATTACH_PROJECTION -> {
+                if (projectionAttached) {
+                    Logger.log("Service", "projection already attached, ignoring")
+                    return START_STICKY
+                }
+
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
+                val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(EXTRA_DATA, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(EXTRA_DATA)
+                }
+
+                Logger.log("Service", "attaching projection resultCode=$resultCode dataNull=${data == null}")
+
+                if (resultCode != android.app.Activity.RESULT_OK || data == null) {
+                    Logger.log("Service", "FAIL: bad resultCode or null data")
+                    return START_STICKY
+                }
+
+                val projMgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+
+                // This call is now valid: foreground service with mediaProjection type is running
+                val projection: MediaProjection = try {
+                    projMgr.getMediaProjection(resultCode, data)
+                } catch (e: Exception) {
+                    Logger.log("Service", "getMediaProjection EXCEPTION: ${e.message}")
+                    return START_STICKY
+                } ?: run {
+                    Logger.log("Service", "getMediaProjection returned null")
+                    return START_STICKY
+                }
+
+                Logger.log("Service", "MediaProjection obtained OK")
+                projectionAttached = true
+
+                updateNotif("Active")
+                startCapture(projection)
+            }
+
+            else -> {
+                Logger.log("Service", "unknown action: $action")
+            }
         }
 
-        Logger.log("Service", "starting ScreenCaptureManager")
+        return START_STICKY
+    }
+
+    private fun startCapture(projection: MediaProjection) {
+        Logger.log("Service", "starting capture")
         capture  = ScreenCaptureManager(this, projection).also { it.start() }
-        Logger.log("Service", "screen: ${capture!!.screenWidth}x${capture!!.screenHeight}")
+        Logger.log("Service", "capture started ${capture!!.screenWidth}x${capture!!.screenHeight}")
 
         detector = EnemyDetector(capture!!.screenWidth, capture!!.screenHeight)
         overlay  = OverlayManager(
@@ -75,14 +138,12 @@ class AimbotService : Service() {
                 Logger.log("Service", "aimbot enabled=$on")
             }
         )
-
         mainHandler.post { overlay?.show() }
         startScanLoop()
-        return START_STICKY
     }
 
     private fun onFire(fireX: Float, fireY: Float) {
-        Logger.log("Service", "onFire fireX=$fireX fireY=$fireY enabled=$enabled target=$lastTarget")
+        Logger.log("Service", "fire at $fireX,$fireY enabled=$enabled target=$lastTarget")
         if (enabled) {
             val target = lastTarget
             if (target != null) {
@@ -98,10 +159,10 @@ class AimbotService : Service() {
                 val from = PointF(cx + jx, cy + jy)
                 val to   = PointF(from.x + dx * 0.6f, from.y + dy * 0.6f)
 
-                Logger.log("Service", "swipeAim from=(${from.x},${from.y}) to=(${to.x},${to.y})")
+                Logger.log("Service", "swipe (${from.x.toInt()},${from.y.toInt()}) -> (${to.x.toInt()},${to.y.toInt()})")
                 InputInjector.swipeAim(from, to, aimMs())
             } else {
-                Logger.log("Service", "no target detected, skipping aim")
+                Logger.log("Service", "no target, skip aim")
             }
         }
         InputInjector.reInjectTap(fireX, fireY)
@@ -116,15 +177,10 @@ class AimbotService : Service() {
                     frameCount++
                     val hit = detector?.detect(bmp)
                     bmp.recycle()
-                    if (hit != null) {
-                        detectCount++
-                        lastTarget = hit
-                    } else {
-                        lastTarget = null
-                    }
-                    // Log stats every 30 frames (~2s)
+                    lastTarget = hit
+                    if (hit != null) detectCount++
                     if (frameCount % 30 == 0) {
-                        Logger.log("Service", "frames=$frameCount detections=$detectCount lastTarget=$lastTarget")
+                        Logger.log("Service", "frames=$frameCount detects=$detectCount last=$lastTarget")
                     }
                     mainHandler.post { overlay?.updateDebugDot(hit) }
                 }
@@ -138,20 +194,24 @@ class AimbotService : Service() {
         job.cancel()
         mainHandler.post { overlay?.hide() }
         capture?.stop()
-        ProjectionHolder.projection = null
         super.onDestroy()
     }
 
     private fun createChannel() {
-        val ch = NotificationChannel(CHANNEL_ID, "Aimbot", NotificationManager.IMPORTANCE_LOW)
+        val ch = NotificationChannel(CHANNEL_ID, "FFAimbot", NotificationManager.IMPORTANCE_LOW)
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
     }
 
-    private fun buildNotif(): Notification =
+    private fun buildNotif(text: String): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("FFAimbot")
-            .setContentText("Running")
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
+
+    private fun updateNotif(text: String) {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(NOTIF_ID, buildNotif(text))
+    }
 }
