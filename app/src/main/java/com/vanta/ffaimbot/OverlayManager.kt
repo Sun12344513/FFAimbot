@@ -27,6 +27,7 @@ class OverlayManager(
     private var debugDot: View? = null
 
     fun show() {
+        Logger.log("Overlay", "show() sw=$sw sh=$sh")
         addControl()
         addFireProxy()
         addDebugDot()
@@ -38,9 +39,8 @@ class OverlayManager(
                 try { wm.removeView(v) } catch (e: Exception) { /* ignore */ }
             }
         }
-        controlView = null
-        fireProxy = null
-        debugDot = null
+        controlView = null; fireProxy = null; debugDot = null
+        Logger.log("Overlay", "hidden")
     }
 
     fun updateDebugDot(point: PointF?) {
@@ -62,19 +62,20 @@ class OverlayManager(
             setBackgroundColor(Color.argb(200, 0, 0, 0))
             setPadding(20, 20, 20, 20)
         }
-
         root.addView(TextView(context).apply {
             text = "AIMBOT OB55"
             setTextColor(Color.WHITE)
             textSize = 11f
         })
-
         @Suppress("DEPRECATION")
         root.addView(Switch(context).apply {
             text = "Enable"
             setTextColor(Color.WHITE)
             isChecked = false
-            setOnCheckedChangeListener { _, on -> onAimbotToggled(on) }
+            setOnCheckedChangeListener { _, on ->
+                Logger.log("Overlay", "aimbot toggled: $on")
+                onAimbotToggled(on)
+            }
         })
 
         val lp = overlayParams(
@@ -82,25 +83,27 @@ class OverlayManager(
             WindowManager.LayoutParams.WRAP_CONTENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 24
-            y = 100
+            x = 24; y = 100
         }
         wm.addView(root, lp)
         controlView = root
+        Logger.log("Overlay", "control panel added")
     }
 
     private fun addFireProxy() {
-        // Right 42%, bottom 38% of screen — covers FF's default fire button zone.
-        // Adjust if using a custom HUD scale in FF settings.
         val w = (sw * 0.42f).toInt()
         val h = (sh * 0.38f).toInt()
+        val px = sw - w
+        val py = sh - h
+        Logger.log("Overlay", "fire proxy: x=$px y=$py w=$w h=$h")
 
         val proxy = object : View(context) {
             override fun onTouchEvent(event: MotionEvent): Boolean {
                 if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                    Logger.log("Overlay", "fire intercepted at rawX=${event.rawX} rawY=${event.rawY}")
                     onFireIntercepted(event.rawX, event.rawY)
                 }
-                return true  // consume — service re-injects the original tap via Shizuku
+                return true
             }
         }
         proxy.setBackgroundColor(Color.TRANSPARENT)
@@ -113,8 +116,7 @@ class OverlayManager(
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = sw - w
-            y = sh - h
+            x = px; y = py
         }
         wm.addView(proxy, lp)
         fireProxy = proxy
