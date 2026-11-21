@@ -1,3 +1,4 @@
+// language: Kotlin, file: AimbotService.kt
 package com.vanta.ffaimbot
 
 import android.app.Notification
@@ -23,9 +24,7 @@ import kotlinx.coroutines.launch
 class AimbotService : Service() {
 
     companion object {
-        // Action: start foreground only — no projection yet
         const val ACTION_START_FG          = "com.vanta.ffaimbot.START_FG"
-        // Action: attach MediaProjection after Activity gets the result
         const val ACTION_ATTACH_PROJECTION = "com.vanta.ffaimbot.ATTACH_PROJECTION"
 
         const val EXTRA_RESULT_CODE = "result_code"
@@ -58,7 +57,6 @@ class AimbotService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
-        // Enter foreground immediately — Android 14 requires this before getMediaProjection()
         startForeground(NOTIF_ID, buildNotif("Waiting for screen capture…"))
         Logger.log("Service", "onCreate — foreground started, waiting for projection")
         InputInjector.init()
@@ -70,14 +68,17 @@ class AimbotService : Service() {
 
         when (action) {
             ACTION_START_FG -> {
-                // Already handled in onCreate — foreground is running.
-                // MainActivity will send ACTION_ATTACH_PROJECTION shortly.
                 Logger.log("Service", "foreground ready, awaiting projection data")
             }
 
             ACTION_ATTACH_PROJECTION -> {
                 if (projectionAttached) {
                     Logger.log("Service", "projection already attached, ignoring")
+                    return START_STICKY
+                }
+
+                if (intent == null) {
+                    Logger.log("Service", "FAIL: intent is null")
                     return START_STICKY
                 }
 
@@ -98,7 +99,6 @@ class AimbotService : Service() {
 
                 val projMgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-                // This call is now valid: foreground service with mediaProjection type is running
                 val projection: MediaProjection = try {
                     projMgr.getMediaProjection(resultCode, data)
                 } catch (e: Exception) {
@@ -111,13 +111,12 @@ class AimbotService : Service() {
 
                 Logger.log("Service", "MediaProjection obtained OK")
                 projectionAttached = true
-
                 updateNotif("Active")
                 startCapture(projection)
             }
 
             else -> {
-                Logger.log("Service", "unknown action: $action")
+                Logger.log("Service", "unknown or null action")
             }
         }
 
@@ -126,11 +125,11 @@ class AimbotService : Service() {
 
     private fun startCapture(projection: MediaProjection) {
         Logger.log("Service", "starting capture")
-        capture  = ScreenCaptureManager(this, projection).also { it.start() }
+        capture = ScreenCaptureManager(this, projection).also { it.start() }
         Logger.log("Service", "capture started ${capture!!.screenWidth}x${capture!!.screenHeight}")
 
         detector = EnemyDetector(capture!!.screenWidth, capture!!.screenHeight)
-        overlay  = OverlayManager(
+        overlay = OverlayManager(
             context           = this,
             onFireIntercepted = ::onFire,
             onAimbotToggled   = { on ->
