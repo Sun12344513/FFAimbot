@@ -1,8 +1,6 @@
-// language: Groovy DSL, target SDK 34, minSDK 28 (Android 9+)
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
-    id 'kotlin-kapt'
 }
 
 android {
@@ -11,15 +9,10 @@ android {
 
     defaultConfig {
         applicationId "com.vanta.ffaimbot"
-        minSdk 28
+        minSdk 29
         targetSdk 34
         versionCode 1
-        versionName "1.0-OB55"
-    }
-
-    buildFeatures {
-        viewBinding true
-        aidl true
+        versionName "1.0"
     }
 
     compileOptions {
@@ -30,27 +23,13 @@ android {
     kotlinOptions {
         jvmTarget = '17'
     }
-
-    packagingOptions {
-        resources {
-            excludes += '/META-INF/{AL2.0,LGPL2.1}'
-        }
-    }
 }
 
 dependencies {
-    // Shizuku — ADB-level binder access without root
     implementation 'dev.rikka.shizuku:api:13.1.5'
     implementation 'dev.rikka.shizuku:provider:13.1.5'
-
-    // Hidden API access via reflection helpers
-    implementation 'dev.rikka.tools.refine:runtime:4.4.0'
-    compileOnly 'dev.rikka.tools.refine:annotation:4.4.0'
-    kapt 'dev.rikka.tools.refine:annotation-processor:4.4.0'
-
     implementation 'androidx.core:core-ktx:1.12.0'
     implementation 'androidx.appcompat:appcompat:1.6.1'
-    implementation 'com.google.android.material:material:1.11.0'
     implementation 'androidx.lifecycle:lifecycle-service:2.7.0'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
 }
