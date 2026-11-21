@@ -1,6 +1,3 @@
-// language: Kotlin, file: ScreenCaptureManager.kt
-// Manages MediaProjection VirtualDisplay → ImageReader pipeline.
-// Delivers RGBA bitmaps to the detector at ~15fps to stay under thermal budget.
 package com.vanta.ffaimbot
 
 import android.content.Context
@@ -9,6 +6,7 @@ import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.media.ImageReader
 import android.media.projection.MediaProjection
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.DisplayMetrics
@@ -21,22 +19,32 @@ class ScreenCaptureManager(
 
     private lateinit var imageReader: ImageReader
     private lateinit var handlerThread: HandlerThread
-    private var screenWidth = 0
-    private var screenHeight = 0
+
+    var screenWidth = 0
+        private set
+    var screenHeight = 0
+        private set
     private var screenDpi = 0
 
     fun start() {
         val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val metrics = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        wm.defaultDisplay.getRealMetrics(metrics)
-        screenWidth = metrics.widthPixels
-        screenHeight = metrics.heightPixels
-        screenDpi = metrics.densityDpi
 
-        handlerThread = HandlerThread("ScreenCapture").also { it.start() }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val metrics = wm.currentWindowMetrics
+            val bounds = metrics.bounds
+            screenWidth = bounds.width()
+            screenHeight = bounds.height()
+            screenDpi = context.resources.displayMetrics.densityDpi
+        } else {
+            val dm = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(dm)
+            screenWidth = dm.widthPixels
+            screenHeight = dm.heightPixels
+            screenDpi = dm.densityDpi
+        }
 
-        // RGBA_8888 for direct bitmap conversion — no YUV decode step needed
+        handlerThread = HandlerThread("SCThread").also { it.start() }
         imageReader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 2)
 
         projection.createVirtualDisplay(
@@ -49,8 +57,7 @@ class ScreenCaptureManager(
         )
     }
 
-    // Returns the most recent captured frame as a Bitmap, or null if none ready.
-    // Caller is responsible for recycling.
+    // Returns the latest captured frame as a Bitmap. Caller must call recycle() after use.
     fun acquireLatestBitmap(): Bitmap? {
         val image = imageReader.acquireLatestImage() ?: return null
         return try {
@@ -58,27 +65,20 @@ class ScreenCaptureManager(
             val buffer = plane.buffer
             val rowStride = plane.rowStride
             val pixelStride = plane.pixelStride
+            val bitmap = Bitmap.createBitmap(screenWidth, screenHeight, Bitmap.Config.ARGB_8888)
 
-            val bitmap = if (rowStride == screenWidth * pixelStride) {
-                // Tight packing — direct copy
-                Bitmap.createBitmap(screenWidth, screenHeight, Bitmap.Config.ARGB_8888).also {
-                    it.copyPixelsFromBuffer(buffer)
-                }
+            if (rowStride == screenWidth * pixelStride) {
+                bitmap.copyPixelsFromBuffer(buffer)
             } else {
-                // Row padding present — copy row by row
-                val corrected = Bitmap.createBitmap(screenWidth, screenHeight, Bitmap.Config.ARGB_8888)
+                // Row padding present — strip padding per row
                 val rowBytes = ByteArray(rowStride)
-                val canvas = android.graphics.Canvas(corrected)
-                val paint = android.graphics.Paint()
+                val stripped = ByteArray(screenWidth * screenHeight * 4)
                 for (row in 0 until screenHeight) {
                     buffer.position(row * rowStride)
-                    buffer.get(rowBytes, 0, rowStride)
-                    val rowBitmap = Bitmap.createBitmap(screenWidth, 1, Bitmap.Config.ARGB_8888)
-                    rowBitmap.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(rowBytes))
-                    canvas.drawBitmap(rowBitmap, 0f, row.toFloat(), paint)
-                    rowBitmap.recycle()
+                    buffer.get(rowBytes)
+                    System.arraycopy(rowBytes, 0, stripped, row * screenWidth * 4, screenWidth * 4)
                 }
-                corrected
+                bitmap.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(stripped))
             }
             bitmap
         } finally {
@@ -87,10 +87,8 @@ class ScreenCaptureManager(
     }
 
     fun stop() {
-        projection.stop()
-        imageReader.close()
-        handlerThread.quitSafely()
+        try { projection.stop() } catch (e: Exception) { /* ignore */ }
+        try { imageReader.close() } catch (e: Exception) { /* ignore */ }
+        try { handlerThread.quitSafely() } catch (e: Exception) { /* ignore */ }
     }
-
-    fun getScreenSize(): Pair<Int, Int> = Pair(screenWidth, screenHeight)
 }
