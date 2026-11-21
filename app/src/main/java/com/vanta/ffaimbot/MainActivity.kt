@@ -8,10 +8,9 @@ import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
 import android.widget.TextView
-import androidx.appcompat.app.AppCompatActivity
 import rikka.shizuku.Shizuku
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : Activity() {
 
     private lateinit var tvStatus: TextView
     private lateinit var btnAction: Button
@@ -52,7 +51,7 @@ class MainActivity : AppCompatActivity() {
                 try {
                     ShizukuHelper.requestPermission(shizukuListener)
                 } catch (e: Exception) {
-                    status("Failed to request Shizuku permission: ${e.message}")
+                    status("Failed: ${e.message}")
                 }
             }
             projData == null -> {
