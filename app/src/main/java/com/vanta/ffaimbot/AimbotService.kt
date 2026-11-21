@@ -1,145 +1,155 @@
-// language: Kotlin, file: AimbotService.kt
-// Foreground service — owns the screen capture loop, enemy detection, and input injection.
-// Lifecycle: started from MainActivity after all permissions confirmed.
 package com.vanta.ffaimbot
 
-import android.app.*
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.graphics.PointF
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.*
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 class AimbotService : Service() {
 
     companion object {
-        const val EXTRA_PROJECTION_DATA = "projection_data"
-        const val EXTRA_PROJECTION_RESULT = "projection_result"
-        private const val CHANNEL_ID = "aimbot_channel"
-        private const val NOTIF_ID = 1
-        private const val TAG = "AimbotService"
+        const val EXTRA_RESULT_CODE  = "result_code"
+        const val EXTRA_DATA         = "data"
+        private const val CHANNEL_ID = "ffaimbot"
+        private const val NOTIF_ID   = 1
+        private const val TAG        = "AimbotService"
+        private const val FPS_DELAY  = 66L   // ~15 fps scan cadence
 
-        // Detection + injection cadence — 15fps is enough for frame scan
-        private const val FRAME_INTERVAL_MS = 66L
-
-        // Swipe duration for aim snap — randomized ±8ms per shot to vary timing signature
-        private fun aimDurationMs() = 28L + (Math.random() * 16).toLong()
+        private fun aimMs(): Long = 28L + (Math.random() * 16).toLong()
     }
 
-    private var captureManager: ScreenCaptureManager? = null
-    private var enemyDetector: EnemyDetector? = null
-    private var overlayManager: OverlayManager? = null
-    private var aimbotEnabled = false
-    private var lastDetected: PointF? = null
+    private var capture: ScreenCaptureManager? = null
+    private var detector: EnemyDetector? = null
+    private var overlay: OverlayManager? = null
 
-    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    @Volatile private var enabled = false
+    @Volatile private var lastTarget: PointF? = null
+
+    private val scope       = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification())
+        createChannel()
+        startForeground(NOTIF_ID, buildNotif())
         InputInjector.init()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val resultCode = intent?.getIntExtra(EXTRA_PROJECTION_RESULT, Activity.RESULT_CANCELED)
+        val code = intent?.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
             ?: Activity.RESULT_CANCELED
-        val data = intent?.getParcelableExtra<Intent>(EXTRA_PROJECTION_DATA)
 
-        if (resultCode != Activity.RESULT_OK || data == null) {
-            Log.e(TAG, "Missing MediaProjection data — stopping")
-            stopSelf(); return START_NOT_STICKY
+        val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent?.getParcelableExtra(EXTRA_DATA, Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent?.getParcelableExtra(EXTRA_DATA)
+        }
+
+        if (code != Activity.RESULT_OK || data == null) {
+            Log.e(TAG, "Bad projection data")
+            stopSelf()
+            return START_NOT_STICKY
         }
 
         val projMgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val projection = projMgr.getMediaProjection(resultCode, data)
+        val projection: MediaProjection = projMgr.getMediaProjection(code, data) ?: run {
+            Log.e(TAG, "getMediaProjection returned null")
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
-        captureManager = ScreenCaptureManager(this, projection).also { it.start() }
-        val (sw, sh) = captureManager!!.getScreenSize()
-        enemyDetector = EnemyDetector(sw, sh)
-
-        overlayManager = OverlayManager(
-            context = this,
-            onFireIntercepted = { x, y -> handleFireProxy(x, y) },
-            onAimbotToggled = { enabled -> aimbotEnabled = enabled }
+        capture  = ScreenCaptureManager(this, projection).also { it.start() }
+        detector = EnemyDetector(capture!!.screenWidth, capture!!.screenHeight)
+        overlay  = OverlayManager(
+            context           = this,
+            onFireIntercepted = ::onFire,
+            onAimbotToggled   = { on -> enabled = on }
         )
-        mainHandler.post { overlayManager?.show() }
 
-        startDetectionLoop()
+        mainHandler.post { overlay?.show() }
+        startScanLoop()
         return START_STICKY
     }
 
-    // Called by OverlayManager when the fire button region is touched.
-    // Aim → re-inject fire tap. Runs on whatever thread the touch arrived on.
-    private fun handleFireProxy(fireX: Float, fireY: Float) {
-        if (aimbotEnabled) {
-            val target = lastDetected
+    // Called when fire proxy overlay intercepts a touch in FF's fire zone.
+    // Aim first, then re-inject the original tap so FF fires.
+    private fun onFire(fireX: Float, fireY: Float) {
+        if (enabled) {
+            val target = lastTarget
             if (target != null) {
-                val (sw, sh) = captureManager?.getScreenSize() ?: Pair(0, 0)
-                // Crosshair sits at screen center — aim swipe from center toward target
-                val centerX = sw / 2f
-                val centerY = sh / 2f
+                val w = capture?.screenWidth  ?: return
+                val h = capture?.screenHeight ?: return
+                val cx = w / 2f
+                val cy = h / 2f
 
-                // Clamp delta — large swipes cause camera overcorrection
-                val dx = (target.x - centerX).coerceIn(-400f, 400f)
-                val dy = (target.y - centerY).coerceIn(-400f, 400f)
+                val dx = (target.x - cx).coerceIn(-400f, 400f)
+                val dy = (target.y - cy).coerceIn(-400f, 400f)
 
-                // Swipe starts from the right half of screen (look area in FF)
-                // Offset start point randomly ±20px to avoid a fixed-origin detection signature
-                val jitterX = (Math.random() * 40 - 20).toFloat()
-                val jitterY = (Math.random() * 40 - 20).toFloat()
-                val swipeStart = PointF(centerX + jitterX, centerY + jitterY)
-                val swipeEnd = PointF(swipeStart.x + dx * 0.6f, swipeStart.y + dy * 0.6f)
-                // 0.6 multiplier — partial correction feels more natural, avoids overshooting
+                // Jitter start ±20px to vary the injection signature
+                val jx = (Math.random() * 40 - 20).toFloat()
+                val jy = (Math.random() * 40 - 20).toFloat()
+                val from = PointF(cx + jx, cy + jy)
+                val to   = PointF(from.x + dx * 0.6f, from.y + dy * 0.6f)
 
-                InputInjector.swipeAim(swipeStart, swipeEnd, aimDurationMs())
+                InputInjector.swipeAim(from, to, aimMs())
             }
         }
-        // Always re-inject the fire tap so FF actually fires
         InputInjector.reInjectTap(fireX, fireY)
     }
 
-    // Coroutine loop — capture frame, detect, cache result, update debug dot
-    private fun startDetectionLoop() {
-        serviceScope.launch {
+    private fun startScanLoop() {
+        scope.launch {
             while (isActive) {
-                val bitmap = captureManager?.acquireLatestBitmap()
-                if (bitmap != null) {
-                    val detected = enemyDetector?.detect(bitmap)
-                    lastDetected = detected
-                    bitmap.recycle()
-                    mainHandler.post { overlayManager?.updateDebugDot(detected) }
+                val bmp = capture?.acquireLatestBitmap()
+                if (bmp != null) {
+                    val hit = detector?.detect(bmp)
+                    lastTarget = hit
+                    bmp.recycle()
+                    mainHandler.post { overlay?.updateDebugDot(hit) }
                 }
-                delay(FRAME_INTERVAL_MS)
+                delay(FPS_DELAY)
             }
         }
     }
 
     override fun onDestroy() {
-        serviceScope.cancel()
-        mainHandler.post { overlayManager?.hide() }
-        captureManager?.stop()
+        scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+        mainHandler.post { overlay?.hide() }
+        capture?.stop()
         super.onDestroy()
     }
 
-    private fun createNotificationChannel() {
+    private fun createChannel() {
         val ch = NotificationChannel(CHANNEL_ID, "Aimbot", NotificationManager.IMPORTANCE_LOW)
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
     }
 
-    private fun buildNotification(): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("FFAimbot Active")
-            .setContentText("Overlay running")
+    private fun buildNotif(): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("FFAimbot")
+            .setContentText("Running")
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
-    }
 }
