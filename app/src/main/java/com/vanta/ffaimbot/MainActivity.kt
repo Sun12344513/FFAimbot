@@ -16,8 +16,6 @@ class MainActivity : Activity() {
     private lateinit var btnAction: Button
     private lateinit var projMgr: MediaProjectionManager
 
-    private var projCode = Activity.RESULT_CANCELED
-    private var projData: Intent? = null
     private var launched = false
 
     private val shizukuListener = Shizuku.OnRequestPermissionResultListener { _, result ->
@@ -54,7 +52,7 @@ class MainActivity : Activity() {
                     status("Failed: ${e.message}")
                 }
             }
-            projData == null -> {
+            ProjectionHolder.projection == null -> {
                 status("Grant screen capture…")
                 requestCapture()
             }
@@ -67,7 +65,7 @@ class MainActivity : Activity() {
                     )
                 )
             }
-            else -> startService()
+            else -> launchService()
         }
     }
 
@@ -76,41 +74,51 @@ class MainActivity : Activity() {
         startActivityForResult(projMgr.createScreenCaptureIntent(), RC_PROJ)
     }
 
-    private fun startService() {
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != RC_PROJ) return
+
+        if (resultCode == Activity.RESULT_OK && data != null) {
+            val projection = try {
+                projMgr.getMediaProjection(resultCode, data)
+            } catch (e: Exception) {
+                status("MediaProjection failed: ${e.message}")
+                return
+            }
+
+            if (projection == null) {
+                status("Screen capture returned null — try again")
+                return
+            }
+
+            ProjectionHolder.projection = projection
+            flow()
+        } else {
+            status("Screen capture denied — try again")
+        }
+    }
+
+    private fun launchService() {
         if (launched) return
         if (!Settings.canDrawOverlays(this)) {
             status("Overlay permission needed")
             return
         }
         launched = true
-        val svc = Intent(this, AimbotService::class.java).apply {
-            putExtra(AimbotService.EXTRA_RESULT_CODE, projCode)
-            putExtra(AimbotService.EXTRA_DATA, projData)
-        }
-        startForegroundService(svc)
+        startForegroundService(Intent(this, AimbotService::class.java))
         status("Running — open FF Max now")
         btnAction.text = "RUNNING"
         btnAction.isEnabled = false
     }
 
-    @Suppress("DEPRECATION")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == RC_PROJ) {
-            if (resultCode == Activity.RESULT_OK && data != null) {
-                projCode = resultCode
-                projData = data
-                flow()
-            } else {
-                status("Screen capture denied")
-            }
-        }
-    }
-
     override fun onResume() {
         super.onResume()
-        if (!launched && projData != null && Settings.canDrawOverlays(this)) {
-            startService()
+        if (!launched
+            && ProjectionHolder.projection != null
+            && Settings.canDrawOverlays(this)
+        ) {
+            launchService()
         }
     }
 
