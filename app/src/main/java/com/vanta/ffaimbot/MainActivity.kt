@@ -1,5 +1,3 @@
-// language: Kotlin, file: MainActivity.kt
-// Permission flow: Shizuku → MediaProjection → SYSTEM_ALERT_WINDOW → start service
 package com.vanta.ffaimbot
 
 import android.app.Activity
@@ -10,25 +8,25 @@ import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
 import android.widget.TextView
-import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import rikka.shizuku.Shizuku
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var statusText: TextView
-    private lateinit var actionButton: Button
+    private lateinit var tvStatus: TextView
+    private lateinit var btnAction: Button
     private lateinit var projMgr: MediaProjectionManager
 
-    private var projectionResultCode = Activity.RESULT_CANCELED
-    private var projectionData: Intent? = null
+    private var projCode = Activity.RESULT_CANCELED
+    private var projData: Intent? = null
+    private var launched = false
 
-    private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { _, result ->
+    private val shizukuListener = Shizuku.OnRequestPermissionResultListener { _, result ->
         if (result == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            updateStatus("Shizuku ✓ — Request screen capture")
-            requestScreenCapture()
+            status("Shizuku OK")
+            requestCapture()
         } else {
-            updateStatus("Shizuku permission denied.")
+            status("Shizuku denied — open Shizuku app and grant permission")
         }
     }
 
@@ -36,87 +34,97 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        statusText = findViewById(R.id.tvStatus)
-        actionButton = findViewById(R.id.btnAction)
-        projMgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        tvStatus  = findViewById(R.id.tvStatus)
+        btnAction = findViewById(R.id.btnAction)
+        projMgr   = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-        actionButton.setOnClickListener { startPermissionFlow() }
-        startPermissionFlow()
+        btnAction.setOnClickListener { flow() }
+        flow()
     }
 
-    private fun startPermissionFlow() {
+    private fun flow() {
         when {
-            !ShizukuHelper.isAvailable() && !ShizukuHelper.hasPermission() -> {
-                updateStatus("Requesting Shizuku permission…")
-                ShizukuHelper.requestPermission(shizukuPermissionListener)
+            !ShizukuHelper.isRunning() -> {
+                status("Shizuku not running — start Shizuku first")
             }
-            ShizukuHelper.hasPermission() && projectionData == null -> {
-                updateStatus("Shizuku ✓ — Request screen capture")
-                requestScreenCapture()
+            !ShizukuHelper.hasPermission() -> {
+                status("Requesting Shizuku permission…")
+                try {
+                    ShizukuHelper.requestPermission(shizukuListener)
+                } catch (e: Exception) {
+                    status("Failed to request Shizuku permission: ${e.message}")
+                }
+            }
+            projData == null -> {
+                status("Grant screen capture…")
+                requestCapture()
             }
             !Settings.canDrawOverlays(this) -> {
-                updateStatus("Grant overlay permission…")
+                status("Grant overlay permission…")
                 startActivity(
-                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                    Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
                 )
             }
-            else -> launchService()
+            else -> startService()
         }
     }
 
-    private fun requestScreenCapture() {
-        @Suppress("DEPRECATION")
-        startActivityForResult(projMgr.createScreenCaptureIntent(), RC_PROJECTION)
+    @Suppress("DEPRECATION")
+    private fun requestCapture() {
+        startActivityForResult(projMgr.createScreenCaptureIntent(), RC_PROJ)
     }
 
-    private fun launchService() {
+    private fun startService() {
+        if (launched) return
         if (!Settings.canDrawOverlays(this)) {
-            updateStatus("Overlay permission required.")
+            status("Overlay permission needed")
             return
         }
-        val intent = Intent(this, AimbotService::class.java).apply {
-            putExtra(AimbotService.EXTRA_PROJECTION_RESULT, projectionResultCode)
-            putExtra(AimbotService.EXTRA_PROJECTION_DATA, projectionData)
+        launched = true
+        val svc = Intent(this, AimbotService::class.java).apply {
+            putExtra(AimbotService.EXTRA_RESULT_CODE, projCode)
+            putExtra(AimbotService.EXTRA_DATA, projData)
         }
-        startForegroundService(intent)
-        updateStatus("Service running. Open FF.")
-        actionButton.text = "RUNNING"
-        actionButton.isEnabled = false
+        startForegroundService(svc)
+        status("Running — open FF Max now")
+        btnAction.text = "RUNNING"
+        btnAction.isEnabled = false
     }
 
-    @Deprecated("Deprecated in Java")
+    @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == RC_PROJECTION) {
+        if (requestCode == RC_PROJ) {
             if (resultCode == Activity.RESULT_OK && data != null) {
-                projectionResultCode = resultCode
-                projectionData = data
-                updateStatus("Screen capture ✓ — Grant overlay")
-                startPermissionFlow()
+                projCode = resultCode
+                projData = data
+                flow()
             } else {
-                updateStatus("Screen capture denied.")
+                status("Screen capture denied")
             }
         }
     }
 
     override fun onResume() {
         super.onResume()
-        // Check overlay after returning from settings
-        if (Settings.canDrawOverlays(this) && projectionData != null) {
-            launchService()
+        if (!launched && projData != null && Settings.canDrawOverlays(this)) {
+            startService()
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        ShizukuHelper.removePermissionListener(shizukuPermissionListener)
+        ShizukuHelper.removePermissionListener(shizukuListener)
     }
 
-    private fun updateStatus(msg: String) {
-        statusText.text = msg
+    private fun status(msg: String) {
+        tvStatus.text = msg
     }
 
     companion object {
-        private const val RC_PROJECTION = 2001
+        private const val RC_PROJ = 2001
     }
 }
