@@ -10,11 +10,9 @@ import android.media.projection.MediaProjection
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -25,7 +23,6 @@ class AimbotService : Service() {
     companion object {
         private const val CHANNEL_ID = "ffaimbot"
         private const val NOTIF_ID   = 1
-        private const val TAG        = "AimbotService"
         private const val FPS_DELAY  = 66L
 
         private fun aimMs(): Long = 28L + (Math.random() * 16).toLong()
@@ -35,8 +32,10 @@ class AimbotService : Service() {
     private var detector: EnemyDetector? = null
     private var overlay: OverlayManager? = null
 
-    @Volatile private var enabled = false
+    @Volatile private var enabled    = false
     @Volatile private var lastTarget: PointF? = null
+    private var frameCount  = 0
+    private var detectCount = 0
 
     private val job         = SupervisorJob()
     private val scope       = CoroutineScope(Dispatchers.Default + job)
@@ -48,24 +47,33 @@ class AimbotService : Service() {
         super.onCreate()
         createChannel()
         startForeground(NOTIF_ID, buildNotif())
-        InputInjector.init()
+        Logger.log("Service", "onCreate")
+
+        val injOk = InputInjector.init()
+        Logger.log("Service", "InputInjector.init = $injOk")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Read projection from singleton — already created in MainActivity.onActivityResult.
-        // Never call getMediaProjection() here: on MIUI the token is consumed on first call.
+        Logger.log("Service", "onStartCommand")
+
         val projection: MediaProjection = ProjectionHolder.projection ?: run {
-            Log.e(TAG, "ProjectionHolder is null — was MainActivity flow skipped?")
+            Logger.log("Service", "FAIL: ProjectionHolder.projection is null")
             stopSelf()
             return START_NOT_STICKY
         }
 
+        Logger.log("Service", "starting ScreenCaptureManager")
         capture  = ScreenCaptureManager(this, projection).also { it.start() }
+        Logger.log("Service", "screen: ${capture!!.screenWidth}x${capture!!.screenHeight}")
+
         detector = EnemyDetector(capture!!.screenWidth, capture!!.screenHeight)
         overlay  = OverlayManager(
             context           = this,
             onFireIntercepted = ::onFire,
-            onAimbotToggled   = { on -> enabled = on }
+            onAimbotToggled   = { on ->
+                enabled = on
+                Logger.log("Service", "aimbot enabled=$on")
+            }
         )
 
         mainHandler.post { overlay?.show() }
@@ -74,36 +82,50 @@ class AimbotService : Service() {
     }
 
     private fun onFire(fireX: Float, fireY: Float) {
+        Logger.log("Service", "onFire fireX=$fireX fireY=$fireY enabled=$enabled target=$lastTarget")
         if (enabled) {
             val target = lastTarget
             if (target != null) {
-                val w = capture?.screenWidth  ?: return
-                val h = capture?.screenHeight ?: return
+                val w  = capture?.screenWidth  ?: return
+                val h  = capture?.screenHeight ?: return
                 val cx = w / 2f
                 val cy = h / 2f
 
                 val dx = (target.x - cx).coerceIn(-400f, 400f)
                 val dy = (target.y - cy).coerceIn(-400f, 400f)
-
                 val jx = (Math.random() * 40 - 20).toFloat()
                 val jy = (Math.random() * 40 - 20).toFloat()
                 val from = PointF(cx + jx, cy + jy)
                 val to   = PointF(from.x + dx * 0.6f, from.y + dy * 0.6f)
 
+                Logger.log("Service", "swipeAim from=(${from.x},${from.y}) to=(${to.x},${to.y})")
                 InputInjector.swipeAim(from, to, aimMs())
+            } else {
+                Logger.log("Service", "no target detected, skipping aim")
             }
         }
         InputInjector.reInjectTap(fireX, fireY)
     }
 
     private fun startScanLoop() {
+        Logger.log("Service", "scan loop started")
         scope.launch {
             while (isActive) {
                 val bmp = capture?.acquireLatestBitmap()
                 if (bmp != null) {
+                    frameCount++
                     val hit = detector?.detect(bmp)
-                    lastTarget = hit
                     bmp.recycle()
+                    if (hit != null) {
+                        detectCount++
+                        lastTarget = hit
+                    } else {
+                        lastTarget = null
+                    }
+                    // Log stats every 30 frames (~2s)
+                    if (frameCount % 30 == 0) {
+                        Logger.log("Service", "frames=$frameCount detections=$detectCount lastTarget=$lastTarget")
+                    }
                     mainHandler.post { overlay?.updateDebugDot(hit) }
                 }
                 delay(FPS_DELAY)
@@ -112,6 +134,7 @@ class AimbotService : Service() {
     }
 
     override fun onDestroy() {
+        Logger.log("Service", "onDestroy")
         job.cancel()
         mainHandler.post { overlay?.hide() }
         capture?.stop()
