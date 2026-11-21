@@ -1,4 +1,3 @@
-// project: FFAimbot, Gradle 8.x
 pluginManagement {
     repositories {
         google()
